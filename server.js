@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const version = "2026-07-28-catalog-price-sync-v1";
+const version = "2026-07-28-catalog-price-sync-v2";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -20,6 +20,8 @@ const wholesalePriceListId = process.env.SHOPIFY_WHOLESALE_PRICE_LIST_ID || "";
 const currencyCode = process.env.SHOPIFY_CURRENCY_CODE || "AUD";
 const syncPageLimit = Number(process.env.SYNC_PAGE_LIMIT || 5);
 const syncRowsPerPage = Number(process.env.SYNC_ROWS_PER_PAGE || 100);
+const cin7RequestDelayMs = Number(process.env.CIN7_REQUEST_DELAY_MS || 1200);
+const cin7RetryAfterMs = Number(process.env.CIN7_RETRY_AFTER_MS || 10000);
 const matchBySku = String(process.env.MATCH_BY_SKU || "false").toLowerCase() === "true";
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
 let tokenCache = { accessToken: "", expiresAt: 0 };
@@ -48,6 +50,8 @@ app.get("/api/diagnostics", (_req, res) => {
     hasWholesalePriceList: Boolean(wholesalePriceListId),
     syncPageLimit,
     syncRowsPerPage,
+    cin7RequestDelayMs,
+    cin7RetryAfterMs,
     matchBySku
   });
 });
@@ -55,9 +59,15 @@ app.get("/api/diagnostics", (_req, res) => {
 app.get("/api/preview", async (req, res) => {
   try {
     const limit = Number(req.query.limit || 20);
-    const rows = await loadCin7PriceRows();
+    const startPage = Number(req.query.startPage || 1);
+    const pageLimit = Number(req.query.pageLimit || 1);
+    const rowsPerPage = Number(req.query.rowsPerPage || 50);
+    const rows = await loadCin7PriceRows({ startPage, pageLimit, rowsPerPage });
     res.json({
       ok: true,
+      startPage,
+      pageLimit,
+      rowsPerPage,
       count: rows.length,
       sample: rows.slice(0, limit)
     });
@@ -86,18 +96,21 @@ app.get("/api/shopify/price-lists", async (_req, res) => {
   }
 });
 
-app.get("/api/sync", async (_req, res) => {
+app.get("/api/sync", async (req, res) => {
   try {
-    const rows = await loadCin7PriceRows();
+    const startPage = Number(req.query.startPage || 1);
+    const pageLimit = Number(req.query.pageLimit || syncPageLimit);
+    const rowsPerPage = Number(req.query.rowsPerPage || syncRowsPerPage);
+    const rows = await loadCin7PriceRows({ startPage, pageLimit, rowsPerPage });
     const result = await syncRowsToShopify(rows);
-    res.json({ ok: true, ...result });
+    res.json({ ok: true, startPage, pageLimit, rowsPerPage, ...result });
   } catch (error) {
     sendError(res, error);
   }
 });
 
-async function loadCin7PriceRows() {
-  const products = await fetchCin7ProductPages(syncPageLimit, syncRowsPerPage);
+async function loadCin7PriceRows({ startPage = 1, pageLimit = syncPageLimit, rowsPerPage = syncRowsPerPage } = {}) {
+  const products = await fetchCin7ProductPages(startPage, pageLimit, rowsPerPage);
   const rows = [];
 
   for (const product of products) {
@@ -240,13 +253,15 @@ function priceListPriceInput(variantId, amount) {
   };
 }
 
-async function fetchCin7ProductPages(pageCount, rows) {
+async function fetchCin7ProductPages(startPage, pageCount, rows) {
   const pages = [];
-  for (let page = 1; page <= pageCount; page += 1) {
+  const endPage = startPage + pageCount - 1;
+  for (let page = startPage; page <= endPage; page += 1) {
     const batch = asArray(await cin7Get("/Products", { page: String(page), rows: String(rows) }));
     if (!batch.length) break;
     pages.push(...batch);
     if (batch.length < rows) break;
+    if (page < endPage) await sleep(cin7RequestDelayMs);
   }
   return pages;
 }
@@ -259,16 +274,26 @@ async function cin7Get(path, params = {}) {
     if (value !== "" && value !== null && value !== undefined) url.searchParams.set(key, value);
   }
 
-  const response = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
-    }
-  });
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "application/json",
+        "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
+      }
+    });
 
-  const json = await readJsonResponse(response, "Cin7 Omni API");
-  if (!response.ok) throw new Error(json?.message || json?.Message || `Cin7 Omni API returned ${response.status}`);
-  return json;
+    const json = await readJsonResponse(response, "Cin7 Omni API");
+    if (response.ok) return json;
+    if (response.status === 429 && attempt < 3) {
+      const retryAfterHeader = Number(response.headers.get("retry-after"));
+      const waitMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+        ? retryAfterHeader * 1000
+        : cin7RetryAfterMs * attempt;
+      await sleep(waitMs);
+      continue;
+    }
+    throw new Error(json?.message || json?.Message || `Cin7 Omni API returned ${response.status}`);
+  }
 }
 
 async function shopifyGraphql(query, variables = {}) {
@@ -382,6 +407,10 @@ function chunk(items, size) {
 
 function asArray(value) {
   return Array.isArray(value) ? value : value ? [value] : [];
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function sendError(res, error) {

@@ -43,6 +43,8 @@ SHOPIFY_CURRENCY_CODE=AUD
 
 SYNC_PAGE_LIMIT=5
 SYNC_ROWS_PER_PAGE=100
+CIN7_REQUEST_DELAY_MS=1200
+CIN7_RETRY_AFTER_MS=10000
 MATCH_BY_SKU=false
 ALLOWED_ORIGIN=*
 ```
@@ -61,6 +63,12 @@ Preview without updating Shopify:
 https://your-render-link.onrender.com/api/preview
 ```
 
+Preview only one small page if Cin7 rate limits:
+
+```text
+https://your-render-link.onrender.com/api/preview?startPage=1&pageLimit=1&rowsPerPage=50
+```
+
 List Shopify price lists and copy the IDs:
 
 ```text
@@ -72,3 +80,11 @@ Run sync:
 ```text
 https://your-render-link.onrender.com/api/sync
 ```
+
+Sync in smaller batches if Cin7 rate limits:
+
+```text
+https://your-render-link.onrender.com/api/sync?startPage=1&pageLimit=5&rowsPerPage=100
+```
+
+Then continue with `startPage=6`, `startPage=11`, and so on.
